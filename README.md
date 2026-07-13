@@ -1,4 +1,4 @@
-<img src="https://raw.githubusercontent.com/Rainb0w-Dash/open-calc/main/New%20Piskel.png" style="width:1.41146in;height:2.11719in" /><img src="[https://raw.githubusercontent.com/Rainb0w-Dash/open-calc/main/New%20Piskel.png](https://raw.githubusercontent.com/Rainb0w-Dash/open-calc/main/opencalc.png)" style="width:6.5in;height:1.02083in" />
+<img src="https://raw.githubusercontent.com/Rainb0w-Dash/open-calc/main/New%20Piskel.png" style="width:1.41146in;height:2.11719in" /><img src="https://raw.githubusercontent.com/Rainb0w-Dash/open-calc/main/New%20Piskel.png" style="width:6.5in;height:1.02083in" />
 
 **<u>THE OPEN CALC</u>**
 
