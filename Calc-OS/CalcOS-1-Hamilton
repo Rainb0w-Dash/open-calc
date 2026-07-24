@@ -1,0 +1,498 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <math.h>
+
+// === Pin mapping for ESP32-S3 WROOM-1 ===
+#define TFT_MOSI 11
+#define TFT_MISO 13
+#define TFT_SCLK 12
+#define TFT_CS   10
+#define TFT_DC   9
+#define TFT_RST  21
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+WebServer server(80);
+
+// Wi-Fi Access Point Credentials
+const char* ap_ssid = "ESP32-GraphCalc";
+const char* ap_password = "password123";
+
+// App Modes
+enum AppMode {
+  MODE_HOME,
+  MODE_GRAPH,
+  MODE_FUNCTIONS,
+  MODE_INFO
+};
+
+AppMode currentMode = MODE_HOME;
+String currentEquation = "sin(x)";
+
+// ==================== MATH EXPRESSION PARSER ====================
+class MathParser {
+  String expr;
+  int pos = 0;
+  double xVal = 0;
+
+  char peek() {
+    while (pos < expr.length() && expr[pos] == ' ') pos++;
+    return (pos < expr.length()) ? expr[pos] : '\0';
+  }
+
+  char getChar() {
+    char c = peek();
+    if (c != '\0') pos++;
+    return c;
+  }
+
+  bool match(char expected) {
+    if (peek() == expected) {
+      pos++;
+      return true;
+    }
+    return false;
+  }
+
+  double parseExpression();
+
+  double parseFactor() {
+    if (match('-')) return -parseFactor();
+    if (match('+')) return parseFactor();
+
+    double result = 0;
+
+    if (match('(')) {
+      result = parseExpression();
+      match(')');
+    } else if ((peek() >= '0' && peek() <= '9') || peek() == '.') {
+      String numStr = "";
+      while ((peek() >= '0' && peek() <= '9') || peek() == '.') {
+        numStr += getChar();
+      }
+      result = numStr.toDouble();
+    } else if (match('x') || match('X')) {
+      result = xVal;
+    } else if (peek() >= 'a' && peek() <= 'z') {
+      String func = "";
+      while (peek() >= 'a' && peek() <= 'z') func += getChar();
+      if (match('(')) {
+        double arg = parseExpression();
+        match(')');
+        if (func == "sin") result = sin(arg);
+        else if (func == "cos") result = cos(arg);
+        else if (func == "tan") result = tan(arg);
+        else if (func == "sqrt") result = sqrt(arg);
+        else if (func == "abs") result = fabs(arg);
+        else if (func == "ln") result = log(arg);
+        else if (func == "exp") result = exp(arg);
+      }
+    }
+
+    if (match('^')) {
+      double exponent = parseFactor();
+      result = pow(result, exponent);
+    }
+
+    return result;
+  }
+
+  double parseTerm() {
+    double left = parseFactor();
+    while (true) {
+      if (match('*')) left *= parseFactor();
+      else if (match('/')) {
+        double denom = parseFactor();
+        left = (denom != 0) ? left / denom : NAN;
+      } else break;
+    }
+    return left;
+  }
+
+public:
+  double evaluate(String expression, double x) {
+    expr = expression;
+    expr.toLowerCase();
+    pos = 0;
+    xVal = x;
+    return parseExpression();
+  }
+};
+
+double MathParser::parseExpression() {
+  double left = parseTerm();
+  while (true) {
+    if (match('+')) left += parseTerm();
+    else if (match('-')) left -= parseTerm();
+    else break;
+  }
+  return left;
+}
+
+// ==================== SCREEN RENDERING ====================
+
+// --- 1. Vertical Home Menu (240 x 320) ---
+void renderHomeScreen() {
+  tft.setRotation(0); // Vertical Orientation
+  tft.fillScreen(ILI9341_BLACK);
+
+  // Top Title Bar
+  tft.fillRect(0, 0, tft.width(), 35, ILI9341_NAVY);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(60, 10);
+  tft.print("MAIN MENU");
+
+  // Vertical Cards
+  tft.drawRoundRect(10, 50, 220, 60, 8, ILI9341_CYAN);
+  tft.setCursor(20, 62);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextSize(2);
+  tft.print("1. Grapher");
+  tft.setCursor(20, 85);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("Plot functions (Landscape)");
+
+  tft.drawRoundRect(10, 120, 220, 60, 8, ILI9341_GREEN);
+  tft.setCursor(20, 132);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(2);
+  tft.print("2. Library");
+  tft.setCursor(20, 155);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("Browse preset formulas");
+
+  tft.drawRoundRect(10, 190, 220, 60, 8, ILI9341_YELLOW);
+  tft.setCursor(20, 202);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setTextSize(2);
+  tft.print("3. System Info");
+  tft.setCursor(20, 225);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("Wi-Fi & hardware status");
+
+  // Footer
+  tft.setCursor(20, 280);
+  tft.setTextColor(ILI9341_LIGHTGREY);
+  tft.print("Web Interface Active");
+  tft.setCursor(20, 295);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.print("http://192.168.4.1");
+}
+
+// --- Horizontal Graph Plotter with Titlebar Indicator (320 x 240) ---
+void plotGraph(String equation, float xMin = -10.0, float xMax = 10.0, float yMin = -7.5, float yMax = 7.5) {
+  tft.setRotation(1); // Widescreen / Landscape
+  tft.fillScreen(ILI9341_BLACK);
+
+  int width = tft.width();
+  int height = tft.height();
+
+  // Axis zero positions
+  int zeroX = (int)((0 - xMin) / (xMax - xMin) * width);
+  int zeroY = height - 18 - (int)((0 - yMin) / (yMax - yMin) * (height - 40));
+
+  // 1. Draw Grid Lines & Numbers
+  tft.setTextSize(1);
+  tft.setTextColor(0x7BEF); // Darker gray for scale numbers
+
+  // X-Axis Grid & Tick Numbers
+  for (float x = ceil(xMin); x <= xMax; x += 2.0) {
+    int px = (int)((x - xMin) / (xMax - xMin) * width);
+    tft.drawFastVLine(px, 22, height - 40, 0x18E3);
+
+    int val = (int)x;
+    if (val % 4 == 0 && val != 0) {
+      int lblY = (zeroY >= 22 && zeroY <= height - 30) ? zeroY + 4 : height - 30;
+      tft.setCursor(px - 6, lblY);
+      tft.print(val);
+    }
+  }
+
+  // Y-Axis Grid & Tick Numbers
+  for (float y = ceil(yMin); y <= yMax; y += 2.0) {
+    int py = height - 18 - (int)((y - yMin) / (yMax - yMin) * (height - 40));
+    tft.drawFastHLine(0, py, width, 0x18E3);
+
+    int val = (int)y;
+    if (val % 4 == 0 && val != 0) {
+      int lblX = (zeroX >= 10 && zeroX <= width - 25) ? zeroX + 4 : 5;
+      tft.setCursor(lblX, py - 3);
+      tft.print(val);
+    }
+  }
+
+  // 2. Draw Solid Main Axes Lines
+  if (zeroX >= 0 && zeroX < width) tft.drawFastVLine(zeroX, 22, height - 40, ILI9341_WHITE);
+  if (zeroY >= 22 && zeroY < height - 18) tft.drawFastHLine(0, zeroY, width, ILI9341_WHITE);
+
+  // 3. Draw Axis Labels ("X" and "Y")
+  tft.setTextColor(ILI9341_YELLOW);
+  if (zeroX >= 0 && zeroX < width - 15) {
+    tft.setCursor(zeroX + 5, 25);
+    tft.print("Y");
+  }
+  if (zeroY >= 22 && zeroY < height - 18) {
+    tft.setCursor(width - 12, zeroY - 10);
+    tft.print("X");
+  }
+
+  // 4. Header Banner with Orientation Tag
+  tft.fillRect(0, 0, width, 22, ILI9341_NAVY);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(6, 7);
+  tft.print("f(x) = " + equation);
+
+  // Horizontal Mode Tag (Top Right)
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setCursor(width - 65, 7);
+  tft.print("[HORIZ]");
+
+  // Clean equation string
+  String cleanedEq = equation;
+  cleanedEq.replace(" ", "");
+  cleanedEq.toLowerCase();
+
+  if (cleanedEq.startsWith("y=")) {
+    cleanedEq = cleanedEq.substring(2);
+  }
+
+  // 5. Check for vertical lines (e.g. "x = 3")
+  if (cleanedEq.startsWith("x=") && cleanedEq.indexOf('y') == -1) {
+    String rhs = cleanedEq.substring(2); 
+    MathParser parser;
+    double targetX = parser.evaluate(rhs, 0); 
+
+    if (!isnan(targetX) && !isinf(targetX)) {
+      int px = (int)((targetX - xMin) / (xMax - xMin) * width);
+      if (px >= 0 && px < width) {
+        tft.drawFastVLine(px, 22, height - 40, ILI9341_CYAN);
+      }
+    }
+  } else {
+    // Standard y = f(x) Plotting Loop
+    MathParser parser;
+    int plotHeight = height - 40;
+    int prevPx = -1, prevPy = -1;
+
+    for (int px = 0; px < width; px++) {
+      float x = xMin + ((float)px / (float)width) * (xMax - xMin);
+      double y = parser.evaluate(cleanedEq, x);
+
+      if (isnan(y) || isinf(y)) { prevPx = -1; continue; }
+
+      int py = height - 18 - (int)(((y - yMin) / (yMax - yMin)) * plotHeight);
+
+      if (py >= 22 && py < height - 18) {
+        if (prevPx != -1 && abs(py - prevPy) < plotHeight / 2) {
+          tft.drawLine(prevPx, prevPy, px, py, ILI9341_CYAN);
+        } else {
+          tft.drawPixel(px, py, ILI9341_CYAN);
+        }
+        prevPx = px; prevPy = py;
+      } else {
+        prevPx = -1;
+      }
+    }
+  }
+
+  // 6. Footer Bar
+  tft.fillRect(0, height - 18, width, 18, ILI9341_DARKGREY);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(6, height - 13);
+  tft.print("Mode: Graph (Landscape) | 192.168.4.1");
+}
+// --- 3. Vertical Function Library (240 x 320) ---
+void renderFunctionsScreen() {
+  tft.setRotation(0); // Vertical Orientation
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.fillRect(0, 0, tft.width(), 30, ILI9341_NAVY);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(30, 7);
+  tft.print("LIBRARY");
+
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(10, 40); tft.print("[ TRIGONOMETRY ]");
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(15, 55); tft.print("• sin(x)       • cos(x)");
+  tft.setCursor(15, 70); tft.print("• tan(x)       • 2*sin(2*x)");
+
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(10, 100); tft.print("[ POLYNOMIALS ]");
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(15, 115); tft.print("• x^2 - 4      • x^3 - 3*x");
+  tft.setCursor(15, 130); tft.print("• sqrt(x)      • 1/x");
+
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(10, 160); tft.print("[ EXPONENTIAL / LOG ]");
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(15, 175); tft.print("• exp(x/3)     • ln(abs(x))");
+  tft.setCursor(15, 190); tft.print("• sin(x)*x     • abs(x) - 3");
+
+  // Footer
+  tft.fillRect(0, tft.height() - 20, tft.width(), 20, ILI9341_DARKGREY);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(10, tft.height() - 14);
+  tft.print("Select options on Web App");
+}
+
+// --- 4. Vertical System Info (240 x 320) ---
+void renderInfoScreen() {
+  tft.setRotation(0); // Vertical Orientation
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.fillRect(0, 0, tft.width(), 30, ILI9341_NAVY);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(45, 7);
+  tft.print("SYSTEM INFO");
+
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setCursor(15, 55);  tft.print("MCU:");
+  tft.setCursor(15, 75);  tft.setTextColor(ILI9341_WHITE); tft.print("ESP32-S3");
+
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setCursor(15, 110); tft.print("Wi-Fi SSID:");
+  tft.setCursor(15, 130); tft.setTextColor(ILI9341_WHITE); tft.print(ap_ssid);
+
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(15, 165); tft.print("Web Server IP:");
+  tft.setCursor(15, 185); tft.setTextColor(ILI9341_WHITE); tft.print("192.168.4.1");
+
+  tft.setTextColor(ILI9341_MAGENTA);
+  tft.setCursor(15, 220); tft.print("Display:");
+  tft.setCursor(15, 240); tft.setTextColor(ILI9341_WHITE); tft.print("ILI9341 SPI");
+
+  // Footer
+  tft.fillRect(0, tft.height() - 20, tft.width(), 20, ILI9341_DARKGREY);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(10, tft.height() - 14);
+  tft.print("Status: Connected / Running");
+}
+
+// Master Mode Switcher
+void setMode(AppMode newMode) {
+  currentMode = newMode;
+  switch (currentMode) {
+    case MODE_HOME:      renderHomeScreen(); break;
+    case MODE_GRAPH:     plotGraph(currentEquation); break;
+    case MODE_FUNCTIONS: renderFunctionsScreen(); break;
+    case MODE_INFO:      renderInfoScreen(); break;
+  }
+}
+
+// ==================== WEB INTERFACE ====================
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 GraphCalc Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #121212; color: #fff; text-align: center; padding: 10px; margin: 0; }
+    .card { background: #1e1e1e; border-radius: 12px; padding: 18px; max-width: 420px; margin: auto; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+    .nav-bar { display: flex; justify-content: space-around; margin-bottom: 15px; background: #2a2a2a; padding: 6px; border-radius: 8px; }
+    .nav-btn { background: none; border: none; color: #aaa; padding: 8px 12px; font-weight: bold; cursor: pointer; border-radius: 6px; }
+    .nav-btn.active { background: #0284c7; color: #fff; }
+    input[type=text] { width: 88%; padding: 12px; font-size: 18px; border-radius: 8px; border: 1px solid #444; background: #2a2a2a; color: #00ffff; margin-bottom: 15px; text-align: center; }
+    button.action { background: #0284c7; color: white; border: none; padding: 12px 18px; font-size: 16px; border-radius: 8px; cursor: pointer; width: 95%; font-weight: bold; }
+    .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 10px; }
+    .preset { background: #2d2d2d; color: #fff; border: 1px solid #444; padding: 10px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    .preset:hover { background: #0284c7; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>📱 GraphCalc Controller</h2>
+    <div class="nav-bar">
+      <button class="nav-btn" onclick="location.href='/setmode?m=0'">🏠 Home</button>
+      <button class="nav-btn" onclick="location.href='/setmode?m=1'">📈 Graph</button>
+      <button class="nav-btn" onclick="location.href='/setmode?m=2'">📚 Library</button>
+      <button class="nav-btn" onclick="location.href='/setmode?m=3'">ℹ️ Info</button>
+    </div>
+
+    <form action="/plot" method="GET">
+      <input type="text" name="expr" id="expr" value="sin(x)" placeholder="e.g. x^2 - 4" required>
+      <button type="submit" class="action">Plot to TFT Display</button>
+    </form>
+
+    <h3>Quick Presets</h3>
+    <div class="grid">
+      <button class="preset" onclick="setExpr('sin(x)')">sin(x)</button>
+      <button class="preset" onclick="setExpr('cos(x)')">cos(x)</button>
+      <button class="preset" onclick="setExpr('tan(x)')">tan(x)</button>
+      <button class="preset" onclick="setExpr('x^2 - 4')">x² - 4</button>
+      <button class="preset" onclick="setExpr('x^3 - 3*x')">x³ - 3x</button>
+      <button class="preset" onclick="setExpr('sqrt(x)')">sqrt(x)</button>
+      <button class="preset" onclick="setExpr('1/x')">1 / x</button>
+      <button class="preset" onclick="setExpr('sin(x)*x')">x·sin(x)</button>
+    </div>
+  </div>
+  <script>
+    function setExpr(val) {
+      document.getElementById('expr').value = val;
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send(200, "text/html", HTML_PAGE);
+}
+
+void handleSetMode() {
+  if (server.hasArg("m")) {
+    int m = server.arg("m").toInt();
+    if (m >= 0 && m <= 3) {
+      setMode((AppMode)m);
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handlePlot() {
+  if (server.hasArg("expr")) {
+    currentEquation = server.arg("expr");
+    setMode(MODE_GRAPH);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// ==================== MAIN SETUP & LOOP ====================
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize Hardware SPI & TFT
+  SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);
+  tft.begin();
+
+  // Initialize Wi-Fi Access Point
+  WiFi.softAP(ap_ssid, ap_password);
+
+  // Register Web Routes
+  server.on("/", handleRoot);
+  server.on("/setmode", handleSetMode);
+  server.on("/plot", handlePlot);
+  server.begin();
+
+  // Draw Home Menu on Boot in Vertical orientation
+  renderHomeScreen();
+}
+
+void loop() {
+  server.handleClient();
+}
